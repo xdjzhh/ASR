@@ -342,6 +342,33 @@
             color: #999;
             margin-top: 5px;
         }
+        
+        /* 麦克风设备选择 */
+        select.device-select {
+            flex: 1;
+            padding: 10px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            background: white;
+            cursor: pointer;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+        select.device-select:focus {
+            border-color: #667eea;
+        }
+        select.device-select:hover {
+            border-color: #667eea;
+        }
+        .device-select option {
+            padding: 8px;
+        }
+        .current-device {
+            font-size: 12px;
+            color: #667eea;
+            margin-top: 4px;
+        }
     </style>
 </head>
 <body>
@@ -394,6 +421,14 @@
                     <!-- 音频控制：音量表 + 灵敏度 + 增益 -->
                     <div class="audio-controls" style="margin-top: 20px;">
                         <div class="control-row">
+                            <div class="control-label">🎙️ 麦克风</div>
+                            <select class="device-select" id="micDeviceSelect" onchange="switchMicDevice(this.value)">
+                                <option value="">加载中...</option>
+                            </select>
+                            <button class="btn btn-secondary" onclick="refreshMicDevices()" style="padding: 8px 12px; font-size: 13px;" title="刷新设备列表">🔄</button>
+                        </div>
+                        <div class="current-device" id="currentDeviceName">—</div>
+                        <div class="control-row" style="margin-top: 15px;">
                             <div class="control-label">🎚️ 输入电平</div>
                             <div class="volume-meter">
                                 <div class="volume-bar" id="volumeBar"></div>
@@ -465,6 +500,8 @@
         let isListening = false;
         let isPaused = false;
         let wakeWords = ['jason', '杰森'];
+        let micDevices = [];
+        let currentDeviceIndex = null;
         
         // DOM
         const statusDisplay = document.getElementById('statusDisplay');
@@ -600,6 +637,12 @@
                     break;
                 case 'volume_updated':
                     break;
+                case 'device_changed':
+                    updateStatus(msg);
+                    break;
+                case 'devices':
+                    micDevices = msg.devices || [];
+                    break;
             }
         }
         
@@ -612,6 +655,14 @@
             btnStop.disabled = !isListening;
             btnPause.disabled = !isListening;
             btnPause.textContent = isPaused ? '▶️ 恢复' : '⏸️ 暂停';
+            
+            // 更新当前设备显示
+            if (status.device_index !== undefined) {
+                currentDeviceIndex = status.device_index;
+                const select = document.getElementById('micDeviceSelect');
+                select.value = currentDeviceIndex !== null ? currentDeviceIndex : '';
+                updateCurrentDeviceDisplay();
+            }
         }
         
         function updateMicState(state) {
@@ -746,6 +797,90 @@
         // 音量表和灵敏度控制
         let currentThreshold = 0.012;
         
+        // ========== 麦克风设备选择 ==========
+        async function refreshMicDevices() {
+            const select = document.getElementById('micDeviceSelect');
+            try {
+                const res = await fetch('/mic/devices');
+                const data = await res.json();
+                micDevices = data.devices || [];
+                
+                // 构建下拉选项
+                select.innerHTML = '';
+                
+                // 添加"系统默认"选项
+                const defaultOpt = document.createElement('option');
+                defaultOpt.value = '';
+                const defaultDev = micDevices.find(d => d.is_default);
+                defaultOpt.textContent = '系统默认' + (defaultDev ? ` (${defaultDev.name})` : '');
+                select.appendChild(defaultOpt);
+                
+                // 添加所有设备
+                micDevices.forEach(dev => {
+                    const opt = document.createElement('option');
+                    opt.value = dev.index;
+                    let label = `[${dev.index}] ${dev.name}`;
+                    if (dev.is_default) label += ' ⭐';
+                    opt.textContent = label;
+                    select.appendChild(opt);
+                });
+                
+                // 设置当前选中
+                if (currentDeviceIndex !== null && currentDeviceIndex !== undefined) {
+                    select.value = currentDeviceIndex;
+                } else {
+                    select.value = '';
+                }
+                
+                updateCurrentDeviceDisplay();
+            } catch (e) {
+                console.error('加载麦克风设备列表失败:', e);
+                select.innerHTML = '<option value="">加载失败</option>';
+            }
+        }
+        
+        function updateCurrentDeviceDisplay() {
+            const nameEl = document.getElementById('currentDeviceName');
+            const select = document.getElementById('micDeviceSelect');
+            const selectedVal = select.value;
+            
+            if (selectedVal === '') {
+                const defaultDev = micDevices.find(d => d.is_default);
+                nameEl.textContent = defaultDev ? `当前: 系统默认 (${defaultDev.name})` : '当前: 系统默认';
+            } else {
+                const dev = micDevices.find(d => d.index === parseInt(selectedVal));
+                nameEl.textContent = dev ? `当前: [${dev.index}] ${dev.name}` : '当前: 未知';
+            }
+        }
+        
+        async function switchMicDevice(value) {
+            const deviceIndex = value === '' ? null : parseInt(value);
+            currentDeviceIndex = deviceIndex;
+            updateCurrentDeviceDisplay();
+            
+            try {
+                const res = await fetch('/mic/device', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ device_index: deviceIndex })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    addResult(`🎙️ 已切换麦克风: ${data.status.device_name || deviceIndex}`, true);
+                    if (data.status) {
+                        updateStatus(data.status);
+                    }
+                } else {
+                    addResult(`❌ 切换麦克风失败: ${data.detail || '未知错误'}`, true);
+                    // 刷新列表恢复正确状态
+                    refreshMicDevices();
+                }
+            } catch (e) {
+                console.error('切换麦克风失败:', e);
+                addResult(`❌ 切换麦克风失败: ${e.message}`, true);
+            }
+        }
+        
         function updateVolumeMeter(rms) {
             const bar = document.getElementById('volumeBar');
             const value = document.getElementById('volumeValue');
@@ -817,6 +952,9 @@
             }
         }
         setTimeout(checkInitialStatus, 500);
+        
+        // 加载麦克风设备列表
+        refreshMicDevices();
     </script>
 </body>
 </html>

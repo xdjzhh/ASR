@@ -112,9 +112,14 @@ async def lifespan(app: FastAPI):
                     if default_ww.lower() == "jason":
                         wake_words.extend(["杰森", "嘉森", "杰逊"])
                     
+                    # 读取指定的麦克风设备
+                    mic_device = os.environ.get("MIC_DEVICE")
+                    mic_device_idx = int(mic_device) if mic_device and mic_device.isdigit() else None
+                    
                     listener = MicrophoneListener(
                         asr_engine=asr_engine,
                         wake_words=wake_words,
+                        device=mic_device_idx,
                         task_callback_url=os.environ.get("TASK_CALLBACK_URL"),
                     )
                     
@@ -197,6 +202,10 @@ class SensitivityRequest(BaseModel):
 
 class VolumeRequest(BaseModel):
     gain: float
+
+
+class DeviceSelectRequest(BaseModel):
+    device_index: Optional[int] = None  # None = 使用默认设备
 
 
 class MicControlRequest(BaseModel):
@@ -333,9 +342,14 @@ def _get_mic_listener() -> "MicrophoneListener":
         if default_ww.lower() == "jason":
             wake_words.extend(["杰森", "嘉森", "杰逊"])
         
+        # 读取指定的麦克风设备（环境变量）
+        mic_device = os.environ.get("MIC_DEVICE")
+        mic_device_idx = int(mic_device) if mic_device and mic_device.isdigit() else None
+        
         listener = MicrophoneListener(
             asr_engine=asr_engine,
             wake_words=wake_words,
+            device=mic_device_idx,
             task_callback_url=os.environ.get("TASK_CALLBACK_URL"),
         )
         
@@ -357,21 +371,24 @@ async def start_mic(req: MicControlRequest = None):
     if listener.running:
         return {"success": True, "message": "麦克风已在监听中", "status": listener.get_status()}
     
-    kwargs = {}
-    if req:
-        if req.device is not None: kwargs["device"] = req.device
-        if req.samplerate is not None: kwargs["samplerate"] = req.samplerate
-        if req.blocksize is not None: kwargs["blocksize"] = req.blocksize
-        if req.wake_words is not None: kwargs["wake_words"] = req.wake_words
-        if req.silence_duration is not None: kwargs["silence_duration"] = req.silence_duration
-        if req.silence_threshold is not None: kwargs["silence_threshold"] = req.silence_threshold
-    
     try:
+        # 如果指定了设备，先设置
+        if req and req.device is not None:
+            ok = listener.set_device(req.device)
+            if not ok:
+                raise HTTPException(status_code=400, detail=f"无效的麦克风设备ID: {req.device}")
+        if req and req.wake_words is not None:
+            listener.set_wake_words(req.wake_words)
+        if req and req.silence_threshold is not None:
+            listener.silence_threshold = req.silence_threshold
+        
         def start_sync():
-            listener.start(**kwargs)
+            listener.start()
         
         await asyncio.get_event_loop().run_in_executor(None, start_sync)
         return {"success": True, "message": "麦克风监听已启动", "status": listener.get_status()}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"启动麦克风失败: {e}")
 
@@ -442,23 +459,31 @@ async def set_volume(req: VolumeRequest):
 
 @app.get("/mic/devices")
 async def list_audio_devices():
-    """列出可用音频设备"""
+    """列出可用音频设备（麦克风）"""
     try:
-        import sounddevice as sd
-        devices = sd.query_devices()
-        input_devices = []
-        for i, dev in enumerate(devices):
-            if dev['max_input_channels'] > 0:
-                input_devices.append({
-                    "id": i,
-                    "name": dev['name'],
-                    "channels": dev['max_input_channels'],
-                    "default_samplerate": dev['default_samplerate'],
-                    "is_default": i == sd.default.device[0],
-                })
-        return {"devices": input_devices, "default": sd.default.device[0]}
+        from microphone_listener import MicrophoneListener
+        input_devices = MicrophoneListener.list_devices()
+        default_idx = next((d["index"] for d in input_devices if d["is_default"]), None)
+        return {"devices": input_devices, "default": default_idx}
     except ImportError:
         raise HTTPException(status_code=500, detail="sounddevice 未安装，请运行: pip install sounddevice")
+
+
+@app.post("/mic/device")
+async def select_mic_device(req: DeviceSelectRequest):
+    """选择/切换麦克风设备（运行时切换，无需重启）"""
+    listener = _get_mic_listener()
+    try:
+        ok = listener.set_device(req.device_index)
+        if ok:
+            status = listener.get_status()
+            return {"success": True, "message": f"已切换到设备 {req.device_index}", "status": status}
+        else:
+            raise HTTPException(status_code=400, detail=f"无法切换到设备 {req.device_index}，设备无效或不可用")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"切换设备失败: {e}")
 
 
 # ===== WebSocket 实时识别 =====
@@ -491,11 +516,16 @@ async def websocket_mic_endpoint(websocket: WebSocket):
                 try:
                     listener = _get_mic_listener()
                     if not listener.running:
+                        # 如果指定了设备，先设置
+                        if "device" in msg and msg["device"] is not None:
+                            ok = listener.set_device(msg["device"])
+                            if not ok:
+                                await websocket.send_json({"type": "error", "message": f"无效的设备ID: {msg['device']}"})
+                                continue
+                        if msg.get("wake_words"):
+                            listener.set_wake_words(msg["wake_words"])
                         def start_sync():
-                            listener.start(
-                                device=msg.get("device"),
-                                wake_words=msg.get("wake_words"),
-                            )
+                            listener.start()
                         await asyncio.get_event_loop().run_in_executor(None, start_sync)
                     await websocket.send_json({"type": "started", **listener.get_status()})
                 except Exception as e:
@@ -505,6 +535,29 @@ async def websocket_mic_endpoint(websocket: WebSocket):
                 if mic_listener:
                     mic_listener.stop()
                     await websocket.send_json({"type": "stopped"})
+            
+            elif action == "set_device":
+                # WebSocket切换麦克风设备
+                try:
+                    from microphone_listener import MicrophoneListener
+                    device_idx = msg.get("device_index")
+                    listener = _get_mic_listener()
+                    ok = listener.set_device(device_idx)
+                    if ok:
+                        await websocket.send_json({"type": "device_changed", **listener.get_status()})
+                    else:
+                        await websocket.send_json({"type": "error", "message": f"切换设备失败: {device_idx}"})
+                except Exception as e:
+                    await websocket.send_json({"type": "error", "message": str(e)})
+            
+            elif action == "get_devices":
+                # WebSocket获取设备列表
+                try:
+                    from microphone_listener import MicrophoneListener
+                    devices = MicrophoneListener.list_devices()
+                    await websocket.send_json({"type": "devices", "devices": devices})
+                except Exception as e:
+                    await websocket.send_json({"type": "error", "message": str(e)})
             
             elif action == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -529,6 +582,7 @@ def main():
     parser.add_argument("--device", type=str, default="cpu", help="运行设备 (cpu 或 cuda:0)")
     parser.add_argument("--ncpu", type=int, default=4, help="CPU 线程数")
     parser.add_argument("--wake-word", type=str, default="jason", help="默认唤醒词")
+    parser.add_argument("--mic-device", type=int, default=None, help="指定麦克风设备ID（通过API /mic/devices 查看）")
     parser.add_argument("--no-auto-mic", action="store_true", help="启动时不自动开启麦克风监听")
     parser.add_argument("--callback-url", type=str, default=None, 
                         help="识别结果回调URL，POST {\"task\": text} 到此地址（默认 http://localhost:8080/run）")
@@ -539,6 +593,8 @@ def main():
     os.environ["ASR_NCPU"] = str(args.ncpu)
     os.environ["AUTO_START_MIC"] = "0" if args.no_auto_mic else "1"
     os.environ["DEFAULT_WAKE_WORD"] = args.wake_word
+    if args.mic_device is not None:
+        os.environ["MIC_DEVICE"] = str(args.mic_device)
     if args.callback_url:
         os.environ["TASK_CALLBACK_URL"] = args.callback_url
     elif "TASK_CALLBACK_URL" not in os.environ:

@@ -408,8 +408,131 @@ class MicrophoneListener:
         self.input_gain = gain
         logger.info(f"音量增益设置为: {gain:.2f}")
     
+    @staticmethod
+    def list_devices() -> List[dict]:
+        """列出所有可用的麦克风（输入）设备，返回设备列表"""
+        try:
+            import sounddevice as sd
+        except ImportError:
+            raise ImportError("请先安装 sounddevice: pip install sounddevice")
+        
+        devices = sd.query_devices()
+        default_input = sd.default.device[0]
+        input_devices = []
+        
+        for i, dev in enumerate(devices):
+            if dev['max_input_channels'] > 0:
+                input_devices.append({
+                    "index": i,
+                    "name": dev['name'],
+                    "channels": dev['max_input_channels'],
+                    "default_samplerate": dev['default_samplerate'],
+                    "is_default": (i == default_input),
+                })
+        
+        return input_devices
+    
+    def get_device(self) -> Optional[int]:
+        """获取当前使用的麦克风设备ID"""
+        return self.device
+    
+    def set_device(self, device_index: Optional[int]) -> bool:
+        """
+        切换麦克风设备（运行时切换，需要重启音频流）
+        - device_index: 设备ID（从 list_devices() 获取），None 使用默认设备
+        返回是否切换成功
+        """
+        # 验证设备有效性
+        if device_index is not None:
+            try:
+                import sounddevice as sd
+                devices = sd.query_devices()
+                if device_index < 0 or device_index >= len(devices):
+                    logger.error(f"设备ID {device_index} 超出范围")
+                    return False
+                dev = devices[device_index]
+                if dev['max_input_channels'] <= 0:
+                    logger.error(f"设备 [{device_index}] {dev['name']} 不是输入设备")
+                    return False
+            except Exception as e:
+                logger.error(f"验证设备失败: {e}")
+                return False
+        
+        old_device = self.device
+        self.device = device_index
+        
+        # 如果正在运行，需要重启音频流
+        if self.running:
+            logger.info(f"切换麦克风设备: {old_device} -> {device_index}")
+            try:
+                # 关闭旧流
+                if self._stream:
+                    try:
+                        self._stream.stop()
+                        self._stream.close()
+                    except Exception as e:
+                        logger.warning(f"关闭旧音频流时出错（可忽略）: {e}")
+                    self._stream = None
+                
+                # 清空队列中的旧数据
+                while not self.audio_queue.empty():
+                    try:
+                        self.audio_queue.get_nowait()
+                    except:
+                        break
+                
+                # 启动新流
+                import sounddevice as sd
+                self._stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=self.channels,
+                    dtype=self.dtype,
+                    blocksize=self.block_size,
+                    device=self.device,
+                    callback=self._audio_callback,
+                )
+                self._stream.start()
+                logger.info(f"✅ 已切换到麦克风设备 [{device_index}]")
+                return True
+            except Exception as e:
+                logger.error(f"切换麦克风失败: {e}")
+                # 回滚到旧设备
+                self.device = old_device
+                try:
+                    self._stream = sd.InputStream(
+                        samplerate=self.sample_rate,
+                        channels=self.channels,
+                        dtype=self.dtype,
+                        blocksize=self.block_size,
+                        device=self.device,
+                        callback=self._audio_callback,
+                    )
+                    self._stream.start()
+                    logger.info(f"已回滚到旧设备 [{old_device}]")
+                except Exception as e2:
+                    logger.error(f"回滚也失败: {e2}")
+                    self.running = False
+                return False
+        else:
+            logger.info(f"麦克风设备已设置为: {device_index}（将在启动时生效）")
+            return True
+    
     def get_status(self) -> dict:
         """获取当前状态"""
+        # 尝试获取当前设备名称
+        device_name = None
+        try:
+            import sounddevice as sd
+            if self.device is not None:
+                dev = sd.query_devices(self.device)
+                device_name = dev.get('name', None)
+            else:
+                default_idx = sd.default.device[0]
+                dev = sd.query_devices(default_idx)
+                device_name = f"{dev.get('name', '默认')} (默认)"
+        except Exception:
+            pass
+        
         return {
             "running": self.running,
             "paused": self.paused,
@@ -419,11 +542,16 @@ class MicrophoneListener:
             "input_gain": self.input_gain,
             "current_rms": self.current_rms,
             "task_callback_url": self.task_callback_url,
+            "device_index": self.device,
+            "device_name": device_name,
         }
     
     def _post_task_callback(self, text: str):
         """
-        在后台线程中发送 HTTP POST 回调，不阻塞音频处理
+        即发即弃（Fire-and-Forget）HTTP POST 回调
+        - 在独立守护线程中发送
+        - 请求发出后立即关闭连接，不等待服务器响应
+        - 不阻塞音频处理线程
         POST {task_callback_url}  body: {"task": text}
         """
         url = self.task_callback_url
@@ -432,26 +560,52 @@ class MicrophoneListener:
         
         def _do_post():
             try:
-                import urllib.request
                 import json as _json
+                from urllib.parse import urlparse
                 
                 payload = _json.dumps({"task": text}, ensure_ascii=False).encode("utf-8")
-                req = urllib.request.Request(
-                    url,
-                    data=payload,
-                    headers={"Content-Type": "application/json; charset=utf-8"},
-                    method="POST",
-                )
-                # 设置超时，避免长时间阻塞
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    resp_body = resp.read().decode("utf-8", errors="replace")
-                    logger.info(f"📤 任务回调已发送 [{resp.status}]: {text} -> {url}")
-                    if resp_body:
-                        logger.debug(f"回调响应: {resp_body[:200]}")
+                parsed = urlparse(url)
+                host = parsed.hostname or "localhost"
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                path = parsed.path or "/"
+                if parsed.query:
+                    path += "?" + parsed.query
+                
+                # 使用 http.client 底层接口，实现真正的 fire-and-forget
+                if parsed.scheme == "https":
+                    import http.client
+                    conn = http.client.HTTPSConnection(host, port, timeout=2)
+                else:
+                    import http.client
+                    conn = http.client.HTTPConnection(host, port, timeout=2)
+                
+                try:
+                    conn.request(
+                        "POST",
+                        path,
+                        body=payload,
+                        headers={
+                            "Content-Type": "application/json; charset=utf-8",
+                            "Content-Length": str(len(payload)),
+                            "Connection": "close",
+                        },
+                    )
+                    # 优雅地关闭写端（发送FIN），确保数据已完整发出
+                    # 不调用 getresponse()，不等待服务器返回
+                    try:
+                        conn.sock.shutdown(1)  # SHUT_WR: 关闭写方向，保留读方向
+                    except Exception:
+                        pass
+                    logger.info(f"📤 任务回调已发送: {text} -> {url}")
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
             except Exception as e:
-                logger.error(f"❌ 任务回调失败 ({url}): {e}")
+                logger.error(f"❌ 任务回调发送失败 ({url}): {e}")
         
-        # 在独立守护线程中发送，不阻塞音频处理循环
+        # 在独立守护线程中发送，完全不阻塞音频处理循环
         t = threading.Thread(target=_do_post, daemon=True, name="task-callback")
         t.start()
 
