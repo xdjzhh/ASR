@@ -575,7 +575,7 @@ async def websocket_mic_endpoint(websocket: WebSocket):
 def main():
     parser = argparse.ArgumentParser(description="VocoType ASR 本地语音转文字服务")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="服务监听地址")
-    parser.add_argument("--port", type=int, default=8000, help="服务端口")
+    parser.add_argument("--port", type=int, default=8081, help="服务端口")
     parser.add_argument("--mode", type=str, default="tiny", 
                         choices=["tiny", "mini", "standard", "paraformer"], 
                         help="模型模式: tiny(SenseVoice~300MB,默认)/mini/standard(VAD+标点~400MB)/paraformer")

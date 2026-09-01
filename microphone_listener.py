@@ -85,6 +85,12 @@ class MicrophoneListener:
         self._process_thread: Optional[threading.Thread] = None
         self._stream = None
         
+        # 任务回调专用线程池（即发即弃：提交后立即返回，后台线程完成HTTP请求）
+        from concurrent.futures import ThreadPoolExecutor
+        self._callback_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="task-callback"
+        )
+        
         # 回调函数
         self.on_wake_word: Optional[Callable[[str], None]] = None  # 检测到唤醒词
         self.on_partial: Optional[Callable[[str], None]] = None     # 实时部分结果
@@ -301,6 +307,13 @@ class MicrophoneListener:
         self.running = True
         self.paused = False
         
+        # 若线程池已被 stop() 关闭，则重建（支持停止后再次启动）
+        if self._callback_executor is None or getattr(self._callback_executor, "_shutdown", False):
+            from concurrent.futures import ThreadPoolExecutor
+            self._callback_executor = ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="task-callback"
+            )
+        
         # 列出音频设备
         logger.info("可用音频设备:")
         try:
@@ -355,6 +368,12 @@ class MicrophoneListener:
         if self._process_thread:
             self._process_thread.join(timeout=3.0)
             self._process_thread = None
+        
+        # 关闭回调线程池（不等待正在发送的回调，守护线程会随进程退出）
+        try:
+            self._callback_executor.shutdown(wait=False)
+        except Exception:
+            pass
         
         # 清空队列
         while not self.audio_queue.empty():
@@ -548,66 +567,44 @@ class MicrophoneListener:
     
     def _post_task_callback(self, text: str):
         """
-        即发即弃（Fire-and-Forget）HTTP POST 回调
-        - 在独立守护线程中发送
-        - 请求发出后立即关闭连接，不等待服务器响应
-        - 不阻塞音频处理线程
+        即发即弃（Fire-and-Forget）任务回调
+        - 提交到后台线程池后【立即返回】，不阻塞识别主循环
+        - 不等待、不使用返回值；成功/失败仅写日志
+        - 后台线程完整完成 HTTP 事务（读取并丢弃响应体），保证连接优雅关闭
         POST {task_callback_url}  body: {"task": text}
         """
         url = self.task_callback_url
         if not url:
             return
         
-        def _do_post():
-            try:
-                import json as _json
-                from urllib.parse import urlparse
-                
-                payload = _json.dumps({"task": text}, ensure_ascii=False).encode("utf-8")
-                parsed = urlparse(url)
-                host = parsed.hostname or "localhost"
-                port = parsed.port or (443 if parsed.scheme == "https" else 80)
-                path = parsed.path or "/"
-                if parsed.query:
-                    path += "?" + parsed.query
-                
-                # 使用 http.client 底层接口，实现真正的 fire-and-forget
-                if parsed.scheme == "https":
-                    import http.client
-                    conn = http.client.HTTPSConnection(host, port, timeout=2)
-                else:
-                    import http.client
-                    conn = http.client.HTTPConnection(host, port, timeout=2)
-                
-                try:
-                    conn.request(
-                        "POST",
-                        path,
-                        body=payload,
-                        headers={
-                            "Content-Type": "application/json; charset=utf-8",
-                            "Content-Length": str(len(payload)),
-                            "Connection": "close",
-                        },
-                    )
-                    # 优雅地关闭写端（发送FIN），确保数据已完整发出
-                    # 不调用 getresponse()，不等待服务器返回
-                    try:
-                        conn.sock.shutdown(1)  # SHUT_WR: 关闭写方向，保留读方向
-                    except Exception:
-                        pass
-                    logger.info(f"📤 任务回调已发送: {text} -> {url}")
-                finally:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.error(f"❌ 任务回调发送失败 ({url}): {e}")
-        
-        # 在独立守护线程中发送，完全不阻塞音频处理循环
-        t = threading.Thread(target=_do_post, daemon=True, name="task-callback")
-        t.start()
+        try:
+            # submit() 微秒级返回，调用方绝不等待
+            self._callback_executor.submit(self._do_task_callback, url, text)
+        except Exception as e:
+            logger.error(f"❌ 任务回调提交失败 ({url}): {e}")
+    
+    @staticmethod
+    def _do_task_callback(url: str, text: str):
+        """后台线程中执行：发送 POST 回调。不读取业务返回值，仅确认请求完成。"""
+        try:
+            import json as _json
+            import urllib.request
+            
+            payload = _json.dumps({"task": text}, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            # 连接/读取超时（仅作用于后台线程）：避免任务服务器无响应时线程永久挂起
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                # 读完响应体后连接优雅关闭（服务器不会收到连接重置）
+                # 返回值不使用，直接丢弃
+                resp.read()
+                logger.info(f"📤 任务回调已发送 [{resp.status}]: {text} -> {url}")
+        except Exception as e:
+            logger.error(f"❌ 任务回调发送失败 ({url}): {e}")
 
 
 # ============ 便捷函数：命令行直接运行麦克风监听 ============
