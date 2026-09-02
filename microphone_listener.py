@@ -9,12 +9,20 @@ import os
 import time
 import threading
 import queue
+import difflib
 import numpy as np
 import logging
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Tuple, Dict
 from collections import deque
 
 logger = logging.getLogger(__name__)
+
+# 拼音模糊匹配为可选能力：pypinyin 缺失时自动降级为纯精确匹配
+try:
+    from pypinyin import lazy_pinyin, Style
+    HAS_PYPINYIN = True
+except Exception:
+    HAS_PYPINYIN = False
 
 
 class MicrophoneListener:
@@ -51,6 +59,9 @@ class MicrophoneListener:
     ):
         self.asr_engine = asr_engine
         self.wake_words = wake_words or ["jason", "杰森", "嘉森", "杰逊"]
+        # 唤醒词拼音缓存（模糊匹配用，唤醒词更新时重建）
+        self._wake_py: List[Dict] = []
+        self._rebuild_wake_pinyin_cache()
         self.sample_rate = sample_rate
         self.channels = channels
         self.dtype = dtype
@@ -167,13 +178,169 @@ class MicrophoneListener:
                     pass
             return ""
     
+    @staticmethod
+    def _strip_punct(s: str) -> str:
+        """去除空白与中英文标点，转小写"""
+        for ch in (" ", "\t", "\n", "，", "。", ",", ".", "！", "!", "？", "?",
+                   "、", "；", ";", "：", ":", "“", "”", "\"", "‘", "’", "'",
+                   "（", "）", "(", ")", "…", "—", "-"):
+            s = s.replace(ch, "")
+        return s.lower()
+
+    def _rebuild_wake_pinyin_cache(self):
+        """预计算每个唤醒词的拼音特征（全拼/首字母/首音节/字数），唤醒词更新时调用"""
+        self._wake_py = []
+        if not HAS_PYPINYIN:
+            return
+        for ww in self.wake_words:
+            feats = self._pinyin_features(ww)
+            if not feats:
+                continue
+            self._wake_py.append({
+                "ww": ww,
+                "full": "".join(f[1] for f in feats),
+                "first": "".join(f[2] for f in feats),
+                "syl0": feats[0][1],
+                "n": len(feats),
+            })
+
+    @staticmethod
+    def _pinyin_features(s: str) -> List[Tuple[str, str, str]]:
+        """
+        提取字符级拼音特征：[(原字符, 全拼无声调, 首字母)]
+        - 汉字 → pypinyin 全拼/首字母（小写）
+        - 英文字母 → 小写保留（兼容英文唤醒词如 jason）
+        - 标点/数字/其他 → 跳过
+        """
+        feats: List[Tuple[str, str, str]] = []
+        if not HAS_PYPINYIN or not s:
+            return feats
+        full_list = lazy_pinyin(s, style=Style.NORMAL, errors="default")
+        first_list = lazy_pinyin(s, style=Style.FIRST_LETTER, errors="default")
+        if len(full_list) != len(s) or len(first_list) != len(s):
+            # 对齐异常时退化为逐字转换
+            full_list = []
+            first_list = []
+            for ch in s:
+                f = lazy_pinyin(ch, style=Style.NORMAL, errors="ignore")
+                i = lazy_pinyin(ch, style=Style.FIRST_LETTER, errors="ignore")
+                full_list.append(f[0] if f else "")
+                first_list.append(i[0] if i else "")
+        for ch, fpy, ipy in zip(s, full_list, first_list):
+            if "\u4e00" <= ch <= "\u9fff":
+                feats.append((ch, (fpy or "").lower(), (ipy or "").lower()))
+            elif ch.isascii() and ch.isalpha():
+                feats.append((ch, ch.lower(), ch.lower()))
+        return feats
+
+    def _fuzzy_match_pinyin(self, text_clean: str) -> Optional[Tuple[float, str, str, str]]:
+        """
+        拼音模糊匹配（仅在精确匹配未命中时调用）。
+
+        ASR 常把唤醒词识别成近音/同音字，例如 "杰森"(jié sēn) 被识别成
+        "接是"(jiē shì)、"节审"(jié shěn)、"杰深"(jié shēn) 等。
+        对文本做与唤醒词字数相同的滑窗（首音节全拼必须一致才进入判定），
+        按以下规则判定（取最高分）：
+          规则1：窗口全拼 == 唤醒词全拼（严格同音字，如 借森→jiesen）
+          规则2：全拼相似度 ≥ 0.80（强信号，允许跟指令连说，如 节审 jieshen ≈ 0.92）
+          规则3：首字母序列吻合 + 全拼相似度 ≥ 0.7 且整段字数 ≤ 唤醒词字数+3
+                 （如 接是打开灯 中「接是」jieshi：首音节 jie 相同、首字母 js 吻合、相似度 0.67）
+        返回 (分数, 唤醒词, 命中片段文字, 命中片段全拼)，未命中返回 None。
+        """
+        if not HAS_PYPINYIN or not self._wake_py:
+            return None
+        feats = self._pinyin_features(text_clean)
+        if not feats:
+            return None
+        n = len(feats)
+        best: Optional[Tuple[float, str, str, str]] = None
+        # 用于未命中诊断：记录"首音节吻合但规则没通过"的最强候选（观察型日志用）
+        top_near: Optional[Tuple[float, str, str, str, str]] = None  # (ratio, ww, win_text, win_full, why)
+        for w in self._wake_py:
+            # 仅取与唤醒词字数相同的窗口（字数不同的高相似度多为巧合，如「件 jian」≈「嘉森 jiasen」）
+            L = w["n"]
+            if L > n:
+                continue
+            # 规则1(R1:全拼完全相同，score=1.0) 与 规则2(R2:相似度≥0.80) 属于强信号：
+            #   2个字符窗口的拼音≥0.80，说明至少5~6个字母匹配（如 jieshen≈jiesen），
+            #   即使后面跟了完整指令（"节审今天天气"，段n=6）也应放行；
+            #   之前 n<=L+2 的整段长度限制是"只说唤醒词"的假设，与用户"唤醒+指令连说"的
+            #   真实输入形态矛盾，导致模糊匹配永无命中（bug）。
+            allow_high = True
+            # 规则3(R3:0.7≤相似度<0.80，专门匹配"接是 jieshi"这类首音节+首字母都吻合
+            #   但元音差较大的弱信号)：放宽到 段长≤L+3，既能放过"接是打开灯"(n=5,L=2)，
+            #   也能把"结实耐用"(n=6)、"请解释一下这个问题"(n=8) 等长句中的假阳性
+            #   jieshi 类词继续拦在外面。
+            allow_low = n <= L + 3
+            for i in range(0, n - L + 1):
+                win = feats[i:i + L]
+                win_text = "".join(f[0] for f in win)
+                win_full = "".join(f[1] for f in win)
+                win_first = "".join(f[2] for f in win)
+                # 首音节全拼必须一致（jie 开头的词不可能匹配 wen/jiu 开头的词）
+                if win[0][1] != w["syl0"]:
+                    continue
+                score = 0.0
+                why = ""
+                ratio = difflib.SequenceMatcher(None, win_full, w["full"]).ratio()
+                if win_full == w["full"] and allow_high:
+                    score = 1.0  # 严格同音/近形字，如 借森→jiesen
+                else:
+                    if ratio >= 0.80 and allow_high:
+                        score = ratio  # 高相似度，如 节审 jieshen vs jiesen ≈ 0.92
+                    elif ratio >= 0.7 and allow_low:
+                        first_ok = (
+                            win_first == w["first"]
+                            or w["first"] in win_first
+                            or win_first in w["first"]
+                        )
+                        # 首音节相同 + 首字母序列吻合（如 接是 jieshi：jie 相同、js 吻合、0.67）
+                        if first_ok:
+                            score = ratio
+                        else:
+                            why = f"首字母{win_first}≠{w['first']}"
+                    elif ratio >= 0.5:  # 未命中但接近，收集到 near miss
+                        if ratio < 0.7:
+                            why = f"相似{ratio:.2f}<0.7"
+                        elif not allow_low:
+                            why = f"段长{n}>L+3={L+3}"
+                        else:
+                            why = "首字母不吻合"
+                if score > 0.0 and (best is None or score > best[0]):
+                    best = (score, w["ww"], win_text, win_full)
+                elif score == 0.0 and ratio >= 0.50 and (
+                    top_near is None or ratio > top_near[0]
+                ):
+                    top_near = (ratio, w["ww"], win_text, win_full, why or "")
+        # 未命中但存在 ≥0.50 的 near-miss：返回 (None, near_miss_log_line) 给调用方打诊断日志
+        diag = None
+        if best is None and top_near is not None:
+            r, ww, wt, wf, why = top_near
+            diag = (
+                f"候选「{wt}」({wf})≈「{ww}」 相似{r:.2f} 未通过原因: {why or '未知'}")
+        return best, diag
+
     def _check_wake_word(self, text: str) -> Optional[str]:
-        """检查文本中是否包含唤醒词，返回匹配的唤醒词"""
-        text_lower = text.lower().replace(" ", "").replace("，", "").replace("。", "").replace(",", "").replace(".", "")
+        """检查文本中是否包含唤醒词，返回匹配的唤醒词（精确匹配优先，未命中走拼音模糊匹配）"""
+        text_clean = self._strip_punct(text)
+        # 1) 精确子串匹配（汉字/英文均适用）
         for wake_word in self.wake_words:
-            ww_lower = wake_word.lower().replace(" ", "")
-            if ww_lower in text_lower:
+            ww_clean = self._strip_punct(wake_word)
+            if ww_clean and ww_clean in text_clean:
                 return wake_word
+        # 2) 拼音模糊匹配（同音/近音字，如 接是/节审/杰深 ≈ 杰森）
+        if HAS_PYPINYIN:
+            hit, diag = self._fuzzy_match_pinyin(text_clean)
+            if hit is not None:
+                score, ww, win_text, win_full = hit
+                ww_full = next((w["full"] for w in self._wake_py if w["ww"] == ww), "")
+                logger.info(
+                    f"🎯 拼音模糊匹配命中: 片段「{win_text}」({win_full}) ≈ "
+                    f"唤醒词「{ww}」({ww_full})，相似度={score:.2f}"
+                )
+                return ww
+            if diag:
+                logger.info(f"🔍 模糊匹配未命中: {diag}  原文: {text!r}")
         return None
     
     def _process_loop(self):
@@ -207,8 +374,14 @@ class MicrophoneListener:
                             total_duration = len(self.speech_buffer) * self.block_duration
                             if total_duration >= 0.4:
                                 text = self._recognize_audio(self.speech_buffer)
+                                seg_rms = float(np.sqrt(np.mean(
+                                    np.concatenate(self.speech_buffer).astype(np.float32) ** 2)))
+                                # 可观测性：待机段无论是否命中唤醒词，都打印 ASR 原文
+                                logger.info(
+                                    f"🎧 待机语音段转写 ({total_duration:.1f}s, "
+                                    f"段RMS={seg_rms:.4f}, 静音阈值={self.silence_threshold:.4f}): {text!r}"
+                                )
                                 if text:
-                                    logger.debug(f"待机检测: {text}")
                                     matched_ww = self._check_wake_word(text)
                                     if matched_ww:
                                         # 检测到唤醒词！
@@ -257,6 +430,7 @@ class MicrophoneListener:
                         total_duration = len(self.command_buffer) * self.block_duration
                         if total_duration >= 0.3:
                             text = self._recognize_audio(self.command_buffer)
+                            logger.info(f"🎧 指令语音段转写 ({total_duration:.1f}s): {text!r}")
                             if text:
                                 # 去掉可能残留的唤醒词
                                 for ww in self.wake_words:
@@ -326,6 +500,12 @@ class MicrophoneListener:
         except Exception as e:
             logger.warning(f"无法列出音频设备: {e}")
         
+        # 未显式指定设备时，自动扫描并跳过"恒定满幅噪声"的坏设备/虚拟声卡
+        if self.device is None:
+            picked = self._auto_select_input_device()
+            if picked is not None:
+                self.device = picked
+
         # 启动音频流
         try:
             self._stream = sd.InputStream(
@@ -337,7 +517,7 @@ class MicrophoneListener:
                 callback=self._audio_callback,
             )
             self._stream.start()
-            logger.info("麦克风音频流已启动")
+            logger.info(f"麦克风音频流已启动（设备 index={self.device}）")
         except Exception as e:
             self.running = False
             raise RuntimeError(f"无法打开麦克风: {e}\n请检查麦克风是否连接并授权。")
@@ -399,6 +579,7 @@ class MicrophoneListener:
     def set_wake_words(self, wake_words: List[str]):
         """设置唤醒词"""
         self.wake_words = wake_words
+        self._rebuild_wake_pinyin_cache()
         logger.info(f"唤醒词已更新: {wake_words}")
     
     def set_sensitivity(self, level: float):
@@ -450,7 +631,108 @@ class MicrophoneListener:
                 })
         
         return input_devices
-    
+
+    # 虚拟声卡 / 远程桌面音频设备名关键词（不能作为本地语音采集设备）
+    _VIRTUAL_DEVICE_KEYWORDS = (
+        "virtual", "虚拟", "cable", "voicemeeter", "vb-audio", "todesk",
+        "声音映射器", "sound mapper",
+    )
+
+    @staticmethod
+    def _auto_select_input_device() -> Optional[int]:
+        """
+        启动时自动选择"真正能拾音"的麦克风。
+
+        背景：部分机器的系统默认输入设备是虚接麦克风口（增益被AGC拉满，
+        输出恒定满幅宽带噪声、对真实声音无响应）或远程桌面虚拟声卡，
+        会导致 VAD 永远判定"有人说话"、语音段永不切分、识别永不触发。
+
+        做法：对 MME 输入设备各采集约 0.8 秒测本底噪声：
+          - 系统默认设备噪声 > 0.05（异常高）且存在噪声 < 0.02（正常）的物理设备
+            → 自动切换到噪声最低的设备；
+          - 其余情况（默认设备正常 / 无法判断）→ 返回 None，沿用系统默认。
+        用户显式指定的设备（--mic-device / 环境变量 / 网页手动切换）不走此逻辑。
+        """
+        import sounddevice as sd
+        try:
+            hostapis = sd.query_hostapis()
+            mme = next((h for h in hostapis if "MME" in h["name"]), None)
+            scan_indices = list(mme["devices"]) if mme else []
+            all_devices = sd.query_devices()
+            default_idx = sd.default.device[0]
+
+            results = []  # (index, name, noise_rms)
+            for idx in scan_indices:
+                dev = all_devices[idx]
+                if dev["max_input_channels"] <= 0:
+                    continue
+                name = dev["name"]
+                try:
+                    rate = int(dev["default_samplerate"] or 44100)
+                    vals: List[float] = []
+                    q: "queue.Queue[np.ndarray]" = queue.Queue()
+
+                    def _probe_cb(indata, frames, t_info, status):
+                        x = indata[:, 0] if indata.ndim > 1 else indata
+                        q.put(x.astype(np.float32).copy())
+
+                    st = sd.InputStream(
+                        samplerate=rate, channels=1, dtype="float32",
+                        blocksize=int(rate * 0.2), device=idx, callback=_probe_cb,
+                    )
+                    st.start()
+                    t0 = time.time()
+                    while time.time() - t0 < 0.8:
+                        try:
+                            blk = q.get(timeout=0.5)
+                            vals.append(float(np.sqrt(np.mean(blk ** 2))))
+                        except queue.Empty:
+                            break
+                    st.stop()
+                    st.close()
+
+                    if vals:
+                        # 跳过第1块（开流暂态），其余取中位数作为本底噪声
+                        noise = float(np.median(vals[1:])) if len(vals) > 1 else float(vals[0])
+                    else:
+                        noise = None
+                    results.append((idx, name, noise))
+                    logger.info(
+                        f"麦克风扫描 [{idx}] {name}: 本底噪声 RMS="
+                        f"{f'{noise:.4f}' if noise is not None else '无数据'}"
+                    )
+                except Exception as e:
+                    results.append((idx, name, None))
+                    logger.warning(f"麦克风扫描 [{idx}] {name}: 打开失败 ({e})")
+
+            def _is_virtual(n: str) -> bool:
+                nl = n.lower()
+                return any(k in nl for k in MicrophoneListener._VIRTUAL_DEVICE_KEYWORDS)
+
+            default_noise = next((r for i, n, r in results if i == default_idx), None)
+            candidates = [(i, n, r) for i, n, r in results
+                          if r is not None and not _is_virtual(n)]
+
+            if candidates:
+                best = min(candidates, key=lambda x: x[2])
+                if default_noise is not None and default_noise > 0.05 and best[2] < 0.02:
+                    logger.warning(
+                        f"⚠️ 系统默认麦克风 [{default_idx}] 本底噪声异常 "
+                        f"(RMS={default_noise:.4f})，疑似虚接/虚拟设备；"
+                        f"自动改用 [{best[0]}] {best[1]} (RMS={best[2]:.4f})。"
+                        f"如不正确可在网页下拉框手动选择麦克风。"
+                    )
+                    return best[0]
+                if default_noise is not None:
+                    logger.info(
+                        f"系统默认麦克风 [{default_idx}] 本底噪声 RMS={default_noise:.4f}，"
+                        f"状态正常，沿用默认设备"
+                    )
+            return None
+        except Exception as e:
+            logger.warning(f"麦克风自动扫描失败，沿用系统默认设备: {e}")
+            return None
+
     def get_device(self) -> Optional[int]:
         """获取当前使用的麦克风设备ID"""
         return self.device
