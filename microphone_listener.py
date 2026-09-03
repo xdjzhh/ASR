@@ -180,15 +180,18 @@ class MicrophoneListener:
     
     @staticmethod
     def _strip_punct(s: str) -> str:
-        """去除空白与中英文标点，转小写"""
-        for ch in (" ", "\t", "\n", "，", "。", ",", ".", "！", "!", "？", "?",
+        """去除中英文标点（保留英文单词之间的空格以便 ASCII 词边界判断），转小写、strip两端空白"""
+        # 中文标点/符号（含全角空格）全删
+        for ch in ("\t", "\n", "，", "。", ",", ".", "！", "!", "？", "?",
                    "、", "；", ";", "：", ":", "“", "”", "\"", "‘", "’", "'",
-                   "（", "）", "(", ")", "…", "—", "-"):
+                   "（", "）", "(", ")", "…", "—", "-", "　"):
             s = s.replace(ch, "")
-        return s.lower()
+        # 英文半角空格：两端 strip，内部压缩但保留（词边界判断要用）
+        s = " ".join(s.split()).lower()
+        return s
 
     def _rebuild_wake_pinyin_cache(self):
-        """预计算每个唤醒词的拼音特征（全拼/首字母/首音节/字数），唤醒词更新时调用"""
+        """预计算每个唤醒词的拼音特征（全拼/首字母/首音节/第二音节首字母/字数），唤醒词更新时调用"""
         self._wake_py = []
         if not HAS_PYPINYIN:
             return
@@ -196,13 +199,17 @@ class MicrophoneListener:
             feats = self._pinyin_features(ww)
             if not feats:
                 continue
-            self._wake_py.append({
+            entry = {
                 "ww": ww,
                 "full": "".join(f[1] for f in feats),
                 "first": "".join(f[2] for f in feats),
                 "syl0": feats[0][1],
                 "n": len(feats),
-            })
+                # 多字唤醒词：第二音节首字母（L≥2 时用来硬约束 R3，区分 s/sh/shen/shu/shi 类）
+                # 例：杰森 → ['jie','sen'] → init1='s'; 嘉森 → jia+sen → init1='s'; 杰逊 → jie+xun → init1='x'
+                "init1": feats[1][2] if len(feats) >= 2 else None,
+            }
+            self._wake_py.append(entry)
 
     @staticmethod
     def _pinyin_features(s: str) -> List[Tuple[str, str, str]]:
@@ -245,13 +252,16 @@ class MicrophoneListener:
           规则2：全拼相似度 ≥ 0.80（强信号，允许跟指令连说，如 节审 jieshen ≈ 0.92）
           规则3：首字母序列吻合 + 全拼相似度 ≥ 0.7 且整段字数 ≤ 唤醒词字数+3
                  （如 接是打开灯 中「接是」jieshi：首音节 jie 相同、首字母 js 吻合、相似度 0.67）
-        返回 (分数, 唤醒词, 命中片段文字, 命中片段全拼)，未命中返回 None。
+        返回 (best, diag)：
+          - best: (score, ww, win_text, win_full, win_start) | None  ——命中或未命中
+          - diag: str | None  ——当 best==None 且存在 ≥ 0.50 的强候选时，给出一行「未命中原因 + 原文」的诊断日志文本，供调用方打 INFO。
+        早退分支（无 pypinyin / 无唤醒词 / 无拼音特征）统一返回 (None, None)。
         """
         if not HAS_PYPINYIN or not self._wake_py:
-            return None
+            return None, None
         feats = self._pinyin_features(text_clean)
         if not feats:
-            return None
+            return None, None
         n = len(feats)
         best: Optional[Tuple[float, str, str, str]] = None
         # 用于未命中诊断：记录"首音节吻合但规则没通过"的最强候选（观察型日志用）
@@ -273,8 +283,13 @@ class MicrophoneListener:
             #   jieshi 类词继续拦在外面。
             allow_low = n <= L + 3
             for i in range(0, n - L + 1):
+                win_text_i = "".join(f[0] for f in feats[i:i + L])
+                # 窗口内是纯ASCII字母（英文 jason 这类）→ 走「ASCII词边界」；否则走中文句首+填充字约束
+                ascii_win = self._is_ascii_word(win_text_i)
+                if not self._wake_word_ok_at(text_clean, i, L, ascii_word=ascii_win):
+                    continue
                 win = feats[i:i + L]
-                win_text = "".join(f[0] for f in win)
+                win_text = win_text_i
                 win_full = "".join(f[1] for f in win)
                 win_first = "".join(f[2] for f in win)
                 # 首音节全拼必须一致（jie 开头的词不可能匹配 wen/jiu 开头的词）
@@ -288,26 +303,41 @@ class MicrophoneListener:
                 else:
                     if ratio >= 0.80 and allow_high:
                         score = ratio  # 高相似度，如 节审 jieshen vs jiesen ≈ 0.92
-                    elif ratio >= 0.7 and allow_low:
+                    elif ratio >= 0.70 and allow_low:
                         first_ok = (
                             win_first == w["first"]
                             or w["first"] in win_first
                             or win_first in w["first"]
                         )
-                        # 首音节相同 + 首字母序列吻合（如 接是 jieshi：jie 相同、js 吻合、0.67）
+                        # R3 低置信门槛三重硬约束（专防 jieshi 形态的 结实/届时/节食/结识 误报）：
+                        #   a) 首音节一致（jie）——已在 L285 之前的 continue 保证
+                        #   b) 首字母序列吻合（如 接是 js == 杰森 js）
+                        #   c) 多字唤醒词：窗口第二音节首字母 == 唤醒词第二音节首字母
+                        #      （如 杰森 init1='s'，所有 shi/shu/sha...「sh声母」字在此全部被拦）
                         if first_ok:
-                            score = ratio
+                            if L >= 2 and w.get("init1") is not None:
+                                win_init1 = win[1][2]  # 窗口第二字 FIRST_LETTER
+                                if win_init1 != w["init1"]:
+                                    why = (
+                                        f"第二声母{win_init1}≠{w['init1']}"
+                                        f"（候选「{win_text}」第二字为{win[1][1]}，"
+                                        f"唤醒词「{w['ww']}」第二字拼音含{w['init1']}声母）"
+                                    )
+                                else:
+                                    score = ratio
+                            else:
+                                score = ratio
                         else:
                             why = f"首字母{win_first}≠{w['first']}"
                     elif ratio >= 0.5:  # 未命中但接近，收集到 near miss
-                        if ratio < 0.7:
-                            why = f"相似{ratio:.2f}<0.7"
+                        if ratio < 0.70:
+                            why = f"相似{ratio:.2f}<0.70"
                         elif not allow_low:
                             why = f"段长{n}>L+3={L+3}"
                         else:
-                            why = "首字母不吻合"
+                            why = "首字母/第二声母不吻合"
                 if score > 0.0 and (best is None or score > best[0]):
-                    best = (score, w["ww"], win_text, win_full)
+                    best = (score, w["ww"], win_text, win_full, i)
                 elif score == 0.0 and ratio >= 0.50 and (
                     top_near is None or ratio > top_near[0]
                 ):
@@ -320,23 +350,66 @@ class MicrophoneListener:
                 f"候选「{wt}」({wf})≈「{ww}」 相似{r:.2f} 未通过原因: {why or '未知'}")
         return best, diag
 
+    # 句首约束：用户唤醒时几乎总是先说唤醒词再说指令，
+    # 极少出现在句中（"帮我问杰芬那个事情"）。允许唤醒词前最多 1 个单字语气词
+    # （嗯/啊/哦/呃/哎/唉/唔），模拟"嗯杰森打开空调"这类真实起手。
+    # 英文（如 jason）按词边界匹配，不参与句首限制（ASR 常把中文+英文连写成 HelloJason）。
+    _FILLER_CHARS = frozenset("嗯啊哦呃哎唉唔")
+    _FILLER_TOLERANCE = 1  # 允许的前导填充字数量
+
+    @classmethod
+    def _is_ascii_word(cls, s: str) -> bool:
+        return bool(s) and all(("\x00" <= c <= "\x7f" and c.isalpha()) for c in s)
+
+    @classmethod
+    def _wake_word_ok_at(cls, text_clean: str, start: int, ww_len: int, *, ascii_word: bool = False) -> bool:
+        """
+        判断唤醒词窗口起始在 start 是否符合位置约束：
+          - 英文（ascii_word=True）：按词边界（前后必须是文本边界或非字母）
+          - 中文（ascii_word=False）：句首 or 前导字全是填充字 & 数量 ≤ TOLERANCE
+        ww_len 仅用于完整性，实际判断由 start 主导。
+        """
+        end = start + ww_len
+        if ascii_word:
+            # 前边界：start==0 或 text_clean[start-1] 不是 ASCII 字母
+            ok_bef = (start == 0) or not (
+                "\x00" <= text_clean[start - 1] <= "\x7f" and text_clean[start - 1].isalpha()
+            )
+            ok_aft = (end >= len(text_clean)) or not (
+                "\x00" <= text_clean[end] <= "\x7f" and text_clean[end].isalpha()
+            )
+            return ok_bef and ok_aft
+        # 中文：句首 or 前导字都是填充字（数量 ≤ FILLER_TOLERANCE）
+        if start == 0:
+            return True
+        if start > cls._FILLER_TOLERANCE:
+            return False
+        return all(text_clean[k] in cls._FILLER_CHARS for k in range(start))
+
     def _check_wake_word(self, text: str) -> Optional[str]:
         """检查文本中是否包含唤醒词，返回匹配的唤醒词（精确匹配优先，未命中走拼音模糊匹配）"""
         text_clean = self._strip_punct(text)
-        # 1) 精确子串匹配（汉字/英文均适用）
+        # 1) 精确子串匹配（汉字/英文均适用）：
+        #    中文必须句首/填充字起手；英文必须 ASCII 词边界（Hello Jason 中的 jason 可命中）
         for wake_word in self.wake_words:
             ww_clean = self._strip_punct(wake_word)
-            if ww_clean and ww_clean in text_clean:
-                return wake_word
+            if not ww_clean:
+                continue
+            ascii_ww = self._is_ascii_word(ww_clean)
+            idx = text_clean.find(ww_clean)
+            while idx >= 0:
+                if self._wake_word_ok_at(text_clean, idx, len(ww_clean), ascii_word=ascii_ww):
+                    return wake_word
+                idx = text_clean.find(ww_clean, idx + 1)
         # 2) 拼音模糊匹配（同音/近音字，如 接是/节审/杰深 ≈ 杰森）
         if HAS_PYPINYIN:
             hit, diag = self._fuzzy_match_pinyin(text_clean)
             if hit is not None:
-                score, ww, win_text, win_full = hit
+                score, ww, win_text, win_full, win_start = hit  # win_start 是窗口起始index
                 ww_full = next((w["full"] for w in self._wake_py if w["ww"] == ww), "")
                 logger.info(
                     f"🎯 拼音模糊匹配命中: 片段「{win_text}」({win_full}) ≈ "
-                    f"唤醒词「{ww}」({ww_full})，相似度={score:.2f}"
+                    f"唤醒词「{ww}」({ww_full})，相似度={score:.2f}，位置i={win_start}"
                 )
                 return ww
             if diag:
