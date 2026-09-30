@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 VocoType ASR 本地语音转文字服务
-基于 Paraformer/SenseVoice (FunASR) 模型
+基于 Paraformer-zh INT8 (sherpa-onnx / ONNX Runtime) 模型
 提供 HTTP API 和 WebSocket 实时识别
 """
 # ===== 在导入任何库之前，先设置环境变量，加速启动并禁止联网检查 =====
 import os
 import sys
 
-# === 内存优化：限制 PyTorch/OpenMP/MKL 线程数，防止内存爆炸 ===
+# === 内存优化：限制 OpenMP/MKL 线程数，防止内存爆炸（ONNX Runtime 也使用 OpenMP）===
 cpu_count = os.cpu_count() or 4
 _opt_threads = str(min(4, cpu_count))  # 最多4线程，足够CPU推理且大幅减少内存
 os.environ.setdefault("OMP_NUM_THREADS", _opt_threads)
@@ -18,20 +18,11 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", _opt_threads)
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", _opt_threads)
 os.environ.setdefault("KMP_BLOCKTIME", "0")  # 减少Intel OpenMP空闲等待内存
 os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
-# 禁用 PyTorch 的 oneDNN 自动调优（减少临时内存）
-os.environ.setdefault("TORCH_CUDNN_V8_API_DISABLED", "1")
-os.environ.setdefault("ONEDNN_MAX_CPU_ISA", "AVX2")  # 限制最高指令集，减少内部workspace
 
-# 模型缓存目录
-os.environ.setdefault("MODELSCOPE_CACHE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
-# 离线模式（模型已下载后使用，禁止联网检查更新）
-os.environ.setdefault("MODELSCOPE_OFFLINE", "0")  # 启动时先允许加载，模型加载后自动设为1
-os.environ.setdefault("HF_HUB_OFFLINE", "0")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "0")
-# 减少日志输出
-os.environ.setdefault("MODELSCOPE_LOG_LEVEL", "40")  # ERROR级别
-os.environ.setdefault("FUNASR_VERBOSE", "0")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # 避免tokenizers警告
+# sherpa-onnx 模型目录（模型自动下载到此处）
+os.environ.setdefault("SHERPA_ONNX_MODELS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
+# 减少 tokenizers 警告
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # ===== 标准库 =====
 import json
@@ -85,7 +76,7 @@ async def lifespan(app: FastAPI):
             broadcast_sync({"type": "loading", "stage": "init", "message": f"正在初始化 ASR 引擎 ({mode})..."})
             logger.info(f"正在初始化 ASR 引擎，模式: {mode}, 设备: {device}")
             
-            # 延迟导入 ASR 引擎（避免启动时就加载 torch/funasr）
+            # 延迟导入 ASR 引擎（避免启动时就加载 sherpa-onnx）
             from asr_engine import ASREngine, get_asr_engine
             asr_engine = get_asr_engine(mode=mode, device=device, ncpu=ncpu)
             
@@ -94,10 +85,7 @@ async def lifespan(app: FastAPI):
             logger.info("✅ ASR 引擎初始化完成！")
             broadcast_sync({"type": "ready", "message": "ASR引擎已就绪"})
             
-            # 模型加载完成后设置离线模式
-            os.environ["MODELSCOPE_OFFLINE"] = "1"
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            # 模型加载完成，sherpa-onnx 完全离线运行，无需联网
             
             # 自动启动麦克风监听
             auto_mic = os.environ.get("AUTO_START_MIC", "1") != "0"
@@ -304,7 +292,8 @@ async def transcribe_audio(file: UploadFile = File(...)):
     
     try:
         audio_bytes = await file.read()
-        text = asr_engine.transcribe_bytes(audio_bytes)
+        result = asr_engine.transcribe_bytes(audio_bytes)
+        text = result.get("text", "") if isinstance(result, dict) else str(result)
         duration = time.time() - start_time
         
         return TranscribeResponse(
@@ -576,9 +565,9 @@ def main():
     parser = argparse.ArgumentParser(description="VocoType ASR 本地语音转文字服务")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="服务监听地址")
     parser.add_argument("--port", type=int, default=8081, help="服务端口")
-    parser.add_argument("--mode", type=str, default="tiny", 
+    parser.add_argument("--mode", type=str, default="standard", 
                         choices=["tiny", "mini", "standard", "paraformer"], 
-                        help="模型模式: tiny(SenseVoice~300MB,默认)/mini/standard(VAD+标点~400MB)/paraformer")
+                        help="模型模式: standard(Paraformer-zh INT8, 默认)/tiny/mini/paraformer")
     parser.add_argument("--device", type=str, default="cpu", help="运行设备 (cpu 或 cuda:0)")
     parser.add_argument("--ncpu", type=int, default=4, help="CPU 线程数")
     parser.add_argument("--wake-word", type=str, default="jason", help="默认唤醒词")
@@ -601,10 +590,10 @@ def main():
         os.environ["TASK_CALLBACK_URL"] = "http://localhost:8080/run"
     
     mode_descs = {
-        "tiny": "SenseVoiceSmall (~300MB)",
-        "mini": "SenseVoice + VAD (~350MB)",
-        "standard": "Paraformer-zh + VAD + 标点 (~400MB)",
-        "paraformer": "Paraformer-zh 纯ASR",
+        "tiny": "Paraformer-zh INT8 (~213MB, sherpa-onnx)",
+        "mini": "Paraformer-zh INT8 (~213MB, sherpa-onnx)",
+        "standard": "Paraformer-zh INT8 (~213MB, sherpa-onnx)",
+        "paraformer": "Paraformer-zh INT8 (~213MB, sherpa-onnx)",
     }
     mode_desc = mode_descs.get(args.mode, args.mode)
     
