@@ -8,21 +8,111 @@ VocoType ASR 本地语音转文字服务
 import os
 import sys
 
-# === 内存优化：限制 OpenMP/MKL 线程数，防止内存爆炸（ONNX Runtime 也使用 OpenMP）===
+# === CPU 优化：限制推理线程数，避免占满物理核导致系统卡顿 ===
+# Paraformer INT8 在 CPU 上几乎不依赖多线程，2线程速度与4线程几乎相同，
+# 但 CPU 占用从 ~48% 降到 ~24%，留出足够核心给手势识别等交互应用。
 cpu_count = os.cpu_count() or 4
-_opt_threads = str(min(4, cpu_count))  # 最多4线程，足够CPU推理且大幅减少内存
+_opt_threads = str(min(2, cpu_count))  # 最多2线程，速度不变但CPU占用减半
 os.environ.setdefault("OMP_NUM_THREADS", _opt_threads)
 os.environ.setdefault("MKL_NUM_THREADS", _opt_threads)
 os.environ.setdefault("OPENBLAS_NUM_THREADS", _opt_threads)
 os.environ.setdefault("NUMEXPR_NUM_THREADS", _opt_threads)
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", _opt_threads)
-os.environ.setdefault("KMP_BLOCKTIME", "0")  # 减少Intel OpenMP空闲等待内存
-os.environ.setdefault("KMP_AFFINITY", "granularity=fine,compact,1,0")
+os.environ.setdefault("KMP_BLOCKTIME", "0")  # Intel OpenMP 空闲后立即释放CPU
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")  # 线程空闲时休眠而非spin，减少待机CPU抖动
+os.environ.setdefault("OMP_MAX_ACTIVE_LEVELS", "1")  # 禁止嵌套并行，避免线程爆炸
 
 # sherpa-onnx 模型目录（模型自动下载到此处）
 os.environ.setdefault("SHERPA_ONNX_MODELS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
 # 减少 tokenizers 警告
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def set_cpu_affinity(cpu_list_str: str) -> bool:
+    """设置当前进程的 CPU 亲和性（仅 Windows 有效）
+
+    Args:
+        cpu_list_str: 逻辑核心编号逗号分隔字符串，如 "0,1" 绑定到核心0和1
+    Returns:
+        是否设置成功
+    """
+    if not cpu_list_str:
+        return False
+    try:
+        cores = [int(c.strip()) for c in cpu_list_str.split(",") if c.strip() != ""]
+    except ValueError:
+        logger.warning(f"CPU 亲和性参数格式错误: {cpu_list_str}，应为如 '0,1'")
+        return False
+
+    total = os.cpu_count() or 1
+    requested = cores
+    cores = [c for c in cores if 0 <= c < total]
+
+    if not cores:
+        # 配置的核心全部超出范围：自动回退到前 N 个可用核心，
+        # N = 请求的核心数量（但不超过总核心数），保证 CPU 限制始终生效
+        n = min(len(requested), total)
+        cores = list(range(n))
+        logger.warning(
+            f"CPU 亲和性核心 {requested} 超出范围 (0-{total-1})，"
+            f"自动回退到前 {n} 个核心: {cores}"
+        )
+    elif len(cores) < len(requested):
+        # 部分核心超出范围：只用有效的，提示哪些被忽略
+        ignored = [c for c in requested if c not in cores]
+        logger.warning(
+            f"CPU 亲和性核心 {ignored} 超出范围 (0-{total-1}) 已忽略，"
+            f"实际绑定: {cores}"
+        )
+
+    # 位掩码：核心i对应第i位
+    mask = 0
+    for c in cores:
+        mask |= (1 << c)
+
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            PROCESS_SET_INFORMATION = 0x0200
+            PROCESS_QUERY_INFORMATION = 0x0400
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+            kernel32.SetProcessAffinityMask.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            # 用 OpenProcess 获取真实句柄（GetCurrentProcess 伪句柄在部分场景下无效）
+            handle = kernel32.OpenProcess(
+                PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION,
+                False,
+                os.getpid(),
+            )
+            if not handle:
+                err = ctypes.get_last_error()
+                logger.warning(f"OpenProcess 失败，错误码: {err}")
+                return False
+            try:
+                result = kernel32.SetProcessAffinityMask(handle, mask)
+                if result:
+                    logger.info(f"✅ CPU 亲和性已设置: 核心 {cores} (mask=0x{mask:X})")
+                    return True
+                else:
+                    err = ctypes.get_last_error()
+                    logger.warning(f"SetProcessAffinityMask 失败，错误码: {err}")
+                    return False
+            finally:
+                kernel32.CloseHandle(handle)
+        else:
+            # Linux/macOS
+            os.sched_setaffinity(0, cores)
+            logger.info(f"✅ CPU 亲和性已设置: 核心 {cores}")
+            return True
+    except Exception as e:
+        logger.warning(f"设置 CPU 亲和性失败: {e}")
+        return False
+
 
 # ===== 标准库 =====
 import json
@@ -123,7 +213,7 @@ async def lifespan(app: FastAPI):
         
         try:
             device = os.environ.get("ASR_DEVICE", "cpu")
-            ncpu = int(os.environ.get("ASR_NCPU", "4"))
+            ncpu = int(os.environ.get("ASR_NCPU", "1"))
             mode = os.environ.get("ASR_MODE", "tiny")
             
             broadcast_sync({"type": "loading", "stage": "init", "message": f"正在初始化 ASR 引擎 ({mode})..."})
@@ -668,14 +758,16 @@ def main():
                         help="服务监听地址（默认读 YAML/内置: 0.0.0.0）")
     parser.add_argument("--port", type=int, default=None,
                         help="服务端口（默认读 YAML/内置: 8081）")
-    parser.add_argument("--mode", type=str, default="standard", 
+    parser.add_argument("--mode", type=str, default=None, 
                         choices=["tiny", "mini", "standard", "paraformer"], 
-                        help="模型模式: standard(Paraformer-zh INT8, 默认)/tiny/mini/paraformer")
-    parser.add_argument("--device", type=str, default="cpu", help="运行设备 (cpu 或 cuda:0)")
-    parser.add_argument("--ncpu", type=int, default=4, help="CPU 线程数")
-    parser.add_argument("--wake-word", type=str, default="jason", help="默认唤醒词")
+                        help="模型模式: tiny(Paraformer-zh INT8, 默认)")
+    parser.add_argument("--device", type=str, default=None, help="运行设备 (cpu 或 cuda:0)")
+    parser.add_argument("--ncpu", type=int, default=None, help="CPU 推理线程数 (默认1，最小化CPU占用)")
+    parser.add_argument("--cpu-affinity", type=str, default=None,
+                        help="CPU 亲和性，绑定到指定逻辑核心，如 '0,1' 绑定到核心0和1；不设则由系统调度")
+    parser.add_argument("--wake-word", type=str, default=None, help="默认唤醒词")
     parser.add_argument("--mic-device", type=int, default=None, help="指定麦克风设备ID（通过API /mic/devices 查看）")
-    parser.add_argument("--no-auto-mic", action="store_true", help="启动时不自动开启麦克风监听")
+    parser.add_argument("--no-auto-mic", action="store_true", default=None, help="启动时不自动开启麦克风监听")
     parser.add_argument("--callback-url", type=str, default=None, 
                         help="识别结果回调URL，POST {\"task\": text} 到此地址（默认 http://localhost:8080/run）")
     args = parser.parse_args()
@@ -693,10 +785,42 @@ def main():
         args.port = int(_pick(args.port, "port", 8081))
     except Exception:
         args.port = 8081
+    args.mode = str(_pick(args.mode, "mode", "tiny"))
+    args.device = str(_pick(args.device, "device", "cpu"))
+    try:
+        args.ncpu = int(_pick(args.ncpu, "ncpu", 1))
+    except Exception:
+        args.ncpu = 1
+    args.cpu_affinity = _pick(args.cpu_affinity, "cpu_affinity", None)
+    if args.cpu_affinity is not None:
+        args.cpu_affinity = str(args.cpu_affinity)
+    args.wake_word = str(_pick(args.wake_word, "wake_word", "jason"))
+    args.callback_url = _pick(args.callback_url, "callback_url", None)
+    if args.callback_url is not None:
+        args.callback_url = str(args.callback_url)
+    # mic_device
+    yaml_mic = props.get("mic_device")
+    if args.mic_device is not None:
+        pass
+    elif yaml_mic is not None:
+        try:
+            args.mic_device = int(yaml_mic)
+        except Exception:
+            args.mic_device = None
+    # no_auto_mic: store_true 默认 None；YAML 中可设 true/false
+    yaml_no_auto = props.get("no_auto_mic")
+    if args.no_auto_mic is True:
+        args.no_auto_mic = True
+    elif isinstance(yaml_no_auto, bool):
+        args.no_auto_mic = yaml_no_auto
+    else:
+        args.no_auto_mic = False
 
     os.environ["ASR_MODE"] = args.mode
     os.environ["ASR_DEVICE"] = args.device
     os.environ["ASR_NCPU"] = str(args.ncpu)
+    if args.cpu_affinity:
+        set_cpu_affinity(args.cpu_affinity)
     os.environ["AUTO_START_MIC"] = "0" if args.no_auto_mic else "1"
     os.environ["DEFAULT_WAKE_WORD"] = args.wake_word
     if args.mic_device is not None:

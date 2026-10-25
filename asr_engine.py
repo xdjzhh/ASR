@@ -65,8 +65,8 @@ class ASREngine:
         vad_model: Optional[str] = None,
         punc_model: Optional[str] = None,
         device: str = "cpu",
-        ncpu: int = 4,
-        mode: str = "standard",
+        ncpu: int = 1,
+        mode: str = "tiny",
         language: str = "zh",
         **kwargs,
     ):
@@ -297,7 +297,7 @@ _asr_engine: Optional[ASREngine] = None
 def get_asr_engine(
     mode: str = "tiny",
     device: str = "cpu",
-    ncpu: int = 4,
+    ncpu: int = 1,
     **kwargs
 ) -> ASREngine:
     global _asr_engine

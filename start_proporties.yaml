@@ -1,4 +1,24 @@
-# VocoType ASR 启动参数（与 Open-AutoGLM server.py 同一模式）
-# 合并优先级：命令行显式参数 > 本文件 > 代码内置默认值
-host: 127.0.0.1
+# VocoType ASR 启动配置文件
+# 优先级：命令行参数 > 本文件 > 内置默认值
+
+# 服务监听
+host: 0.0.0.0
 port: 8081
+
+# ASR 引擎
+mode: tiny          # tiny/mini/standard/paraformer (均为 Paraformer-zh INT8)
+device: cpu         # cpu 或 cuda:0
+ncpu: 1             # CPU 推理线程数
+
+# CPU 亲和性（绑定到指定逻辑核心，避免占满物理核导致系统卡顿）
+# 4核8线程CPU核心编号: 物理核0→逻辑0,4 / 物理核1→逻辑1,5 / 物理核2→逻辑2,6 / 物理核3→逻辑3,7
+# 示例: "0,1" 绑定到核心0和1；留空或注释则由系统调度
+cpu_affinity: "0,1"
+
+# 麦克风
+wake_word: jason
+no_auto_mic: false
+# mic_device: 0    # 指定麦克风设备ID，不设则自动选择
+
+# 回调
+# callback_url: http://localhost:8080/run
