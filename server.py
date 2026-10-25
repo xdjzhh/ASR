@@ -42,12 +42,65 @@ import uvicorn
 import argparse
 import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# 后台日志：控制台之外追加一份文件记录（logs/asr.log）；uvicorn 自带
+# 的 error/access logger 不走 root，单独挂同一 handler。
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FMT = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_file_h = logging.FileHandler(os.path.join(_LOG_DIR, "asr.log"), encoding="utf-8")
+_file_h.setFormatter(_LOG_FMT)
+logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(), _file_h])
+for _uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    logging.getLogger(_uv_name).addHandler(_file_h)
 logger = logging.getLogger(__name__)
+
+# ===== 服务级单例锁（跨平台文件锁：msvcrt 区域锁 / fcntl.flock）=====：锁在
+# 服务身份上，与端口/参数无关（换端口启动同样被拦）。进程存活期间持有；正常退出或 taskkill 强杀后由
+# OS 自动释放——无残留死锁，无需 PID 活性检查与 atexit 清理。
+# 句柄引用保留在模块级（丢引用=GC 关闭文件=锁释放）。
+def _acquire_singleton_lock(lock_name: str):
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             f"{lock_name}.lock")
+    fp = open(lock_path, "a+", encoding="utf-8")
+    fp.write(" ")          # 字节 0 = 锁区占位；PID 写在其后（冲突方可读）
+    fp.flush()
+    try:
+        fp.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)   # Windows：区域锁
+        else:
+            import fcntl
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # Linux/macOS：整文件锁
+    except OSError:
+        old_pid = ""
+        try:
+            fp.seek(1)     # 跳过锁区（字节 0 被独占，读不到）
+            old_pid = fp.read().strip()
+        except Exception:
+            pass
+        print(f"[singleton] 已有实例在运行{f'（PID={old_pid}）' if old_pid else ''}，"
+              f"锁文件={lock_path}，本次启动退出。", flush=True)
+        sys.exit(0)
+    try:
+        fp.seek(0)
+        fp.truncate()
+        fp.write(" ")          # 字节 0 = 锁区占位
+        fp.write(str(os.getpid()))  # PID 写在锁区外，冲突方可读
+        fp.flush()
+    except Exception:
+        pass
+    # fp 故意不关闭：进程存续期间持锁，退出后由 OS 释放
+    return fp
+
+
+_SINGLETON_LOCK_FP = _acquire_singleton_lock("asr")
 
 # 全局状态
 asr_engine: Optional["ASREngine"] = None
 mic_listener = None
+# uvicorn Server 句柄（/exit 用 should_exit=True 进程内优雅停）
+_uvicorn_server = None
 engine_ready = False
 engine_loading = False
 engine_error: Optional[str] = None
@@ -251,6 +304,19 @@ async def periodic_status_broadcast():
 @app.get("/", include_in_schema=False)
 async def root():
     return RedirectResponse(url="/demo")
+
+
+@app.post("/exit")
+async def graceful_exit():
+    """优雅停止（virtualdesk stop 调用）：设置 uvicorn 官方 graceful shutdown
+    标志 should_exit——事件循环等 in-flight 响应写回后收尾（lifespan 钩子停
+    广播/麦克风）。无控制台进程收不到 CTRL_C 事件（GenerateConsoleCtrlEvent
+    成空操作），信号方案弃用。"""
+    srv = globals().get("_uvicorn_server")
+    if srv is None:
+        return {"success": False, "message": "no uvicorn server handle"}
+    srv.should_exit = True
+    return {"success": True, "message": "exiting via uvicorn graceful shutdown"}
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -560,11 +626,48 @@ async def websocket_mic_endpoint(websocket: WebSocket):
             ws_clients.remove(websocket)
 
 
+# ===== 启动参数 YAML（与 Open-AutoGLM server.py 同一模式） =====
+_START_PROPERTIES_NAME = "start_proporties.yaml"
+
+
+def _load_start_properties(config_path=None):
+    """读取启动参数 YAML，返回 dict。
+    文件缺失/解析失败只告警并返回 {}（回退内置默认值），绝不阻断启动。
+    """
+    path = config_path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), _START_PROPERTIES_NAME)
+    if not os.path.isfile(path):
+        logger.info(f"未找到启动参数文件 {path}，使用命令行/内置默认值。")
+        return {}
+    try:
+        import yaml
+    except ImportError:
+        logger.warning(f"未安装 PyYAML，无法读取 {_START_PROPERTIES_NAME}"
+                       f"（pip install pyyaml）；回退命令行/内置默认值。")
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning(f"解析启动参数文件 {path} 失败，回退命令行/内置默认值：{e!r}")
+        return {}
+    if not isinstance(data, dict):
+        logger.warning(f"启动参数文件 {path} 顶层不是键值映射，已忽略。")
+        return {}
+    logger.info(f"已加载启动参数文件：{path}（命令行同名参数优先）")
+    return data
+
+
 # ===== 命令行入口 =====
 def main():
     parser = argparse.ArgumentParser(description="VocoType ASR 本地语音转文字服务")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="服务监听地址")
-    parser.add_argument("--port", type=int, default=8081, help="服务端口")
+    # default=None 表示「命令行未传」：未传回退 start_proporties.yaml，再回退内置默认
+    parser.add_argument("--config", default=None,
+                        help=f"启动参数 YAML 路径（默认=server.py 同目录 {_START_PROPERTIES_NAME}）")
+    parser.add_argument("--host", default=None,
+                        help="服务监听地址（默认读 YAML/内置: 0.0.0.0）")
+    parser.add_argument("--port", type=int, default=None,
+                        help="服务端口（默认读 YAML/内置: 8081）")
     parser.add_argument("--mode", type=str, default="standard", 
                         choices=["tiny", "mini", "standard", "paraformer"], 
                         help="模型模式: standard(Paraformer-zh INT8, 默认)/tiny/mini/paraformer")
@@ -576,7 +679,21 @@ def main():
     parser.add_argument("--callback-url", type=str, default=None, 
                         help="识别结果回调URL，POST {\"task\": text} 到此地址（默认 http://localhost:8080/run）")
     args = parser.parse_args()
-    
+
+    props = _load_start_properties(args.config)
+
+    def _pick(cli_val, yaml_key, builtin_default):
+        """命令行显式值优先；否则取 YAML；YAML 无此项再用内置默认。"""
+        if cli_val is not None:
+            return cli_val
+        return props.get(yaml_key, builtin_default)
+
+    args.host = str(_pick(args.host, "host", "0.0.0.0"))
+    try:
+        args.port = int(_pick(args.port, "port", 8081))
+    except Exception:
+        args.port = 8081
+
     os.environ["ASR_MODE"] = args.mode
     os.environ["ASR_DEVICE"] = args.device
     os.environ["ASR_NCPU"] = str(args.ncpu)
@@ -614,7 +731,13 @@ def main():
     print("⏳ HTTP 服务正在启动...（模型在后台加载，可先打开页面）")
     print("=" * 60)
     
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    # 不用 uvicorn.run：直接持有 Server 实例——/exit 用 should_exit=True 做
+    # 进程内优雅停（uvicorn.run 不暴露 server 句柄）。Server.run() 与
+    # uvicorn.run 等价（同步包装 self.serve()）。
+    _config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+    global _uvicorn_server
+    _uvicorn_server = uvicorn.Server(_config)
+    _uvicorn_server.run()
 
 
 if __name__ == "__main__":

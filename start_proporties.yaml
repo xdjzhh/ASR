@@ -1,0 +1,4 @@
+# VocoType ASR 启动参数（与 Open-AutoGLM server.py 同一模式）
+# 合并优先级：命令行显式参数 > 本文件 > 代码内置默认值
+host: 127.0.0.1
+port: 8081

@@ -49,8 +49,8 @@ class MicrophoneListener:
         sample_rate: int = 16000,
         channels: int = 1,
         dtype = np.float32,
-        block_duration: float = 0.5,   # 每个音频块时长（秒）
-        silence_threshold: float = 0.008,  # 静音阈值（RMS能量），值越大越不灵敏
+        block_duration: float = 0.25,  # 每个音频块时长（秒）——0.25s 可区分真实语音与单脉冲噪声
+        silence_threshold: float = 0.008,  # 静音阈值下限（RMS能量），实际阈值随本底噪声自适应上浮
         silence_duration: float = 1.0,    # 唤醒后多久静音认为说完了（秒）
         wake_silence_duration: float = 0.8,  # 待机时语音段最大间隔
         input_gain: float = 1.0,  # 输入音量增益（<1衰减，>1放大）
@@ -76,7 +76,25 @@ class MicrophoneListener:
         
         # 当前RMS电平（用于UI显示）
         self.current_rms = 0.0
-        
+
+        # ---- 自适应噪声底 / 动态语音阈值 ----
+        # 用最近若干块 RMS 的低分位数估计环境本底噪声，动态阈值 = 噪声底 × 倍数，
+        # 并钳制在 [silence_threshold, max_dynamic_threshold] 之间。
+        # 解决：固定 0.008 阈值在风扇/电流底噪环境下把噪声持续判成"有人说话"。
+        self._rms_history: deque = deque(maxlen=64)  # 64 × 0.25s = 16s 窗口
+        self._active_threshold = float(silence_threshold)  # 当前实际生效的语音阈值
+        self.noise_quantile = 0.25       # 噪声底取 RMS 历史的 25 分位数
+        self.noise_multiplier = 3.5      # 动态阈值 = 噪声底 × 3.5
+        self.max_dynamic_threshold = 0.05
+
+        # ---- 段级语音门（送 ASR 前的硬门，全部为可计算客观量）----
+        # 背景：Paraformer 对短脉冲噪声/纯底噪会"幻觉"出文字，
+        # 必须在音频送入模型前拦掉。真实说"杰森"约 0.6~0.9s 连续发声，
+        # 而磕碰/键盘/点击声通常 <0.3s、最多只占 1 个 0.25s 块。
+        self.min_active_blocks = 2             # 段内活跃块至少 2 个（累计 ≥0.5s）
+        self.min_max_consecutive_active = 2    # 最长连续活跃至少 2 块（持续 ≥0.5s）
+        self.peak_factor = 2.0                 # 段峰值 RMS 需 ≥ 动态阈值 × 2
+
         self.state = self.STATE_IDLE
         self.running = False
         self.paused = False
@@ -128,11 +146,82 @@ class MicrophoneListener:
                 except Exception as e:
                     logger.error(f"状态回调错误: {e}")
     
+    def _update_active_threshold(self) -> float:
+        """
+        根据近期 RMS 历史估计本底噪声并计算动态语音阈值。
+        - 样本不足 10 块（冷启动 2.5s）时沿用用户设定的基础阈值 silence_threshold；
+        - 噪声底 = 近期 RMS 的低分位数；动态阈值 = clamp(噪声底×倍数, 基础阈值, 上限)。
+        """
+        if len(self._rms_history) >= 10:
+            noise_floor = float(np.quantile(list(self._rms_history), self.noise_quantile))
+            dyn = noise_floor * self.noise_multiplier
+            self._active_threshold = float(
+                min(max(dyn, self.silence_threshold), self.max_dynamic_threshold)
+            )
+        else:
+            self._active_threshold = float(self.silence_threshold)
+        return self._active_threshold
+
     def _is_silence(self, audio_block: np.ndarray) -> bool:
-        """判断音频块是否为静音"""
-        rms = np.sqrt(np.mean(audio_block ** 2))
-        self.current_rms = float(rms)
-        return rms < self.silence_threshold
+        """判断音频块是否为静音（阈值随环境本底噪声自适应）"""
+        rms = float(np.sqrt(np.mean(audio_block ** 2)))
+        self.current_rms = rms
+        self._rms_history.append(rms)
+        self._update_active_threshold()
+        return rms < self._active_threshold
+
+    def _segment_stats(self, audio_blocks: List[np.ndarray]) -> Dict[str, float]:
+        """
+        统计一个候选语音段的客观能量特征（不依赖 ASR 结果）：
+        - duration:     段时长（秒）
+        - n_active:     块 RMS ≥ 动态阈值的活跃块数
+        - max_consec:   最长连续活跃块数（区分持续发声 vs 零散脉冲噪声）
+        - peak:         段内最大块 RMS
+        - seg_rms:      整段 RMS
+        - threshold:    统计时生效的动态阈值
+        """
+        thr = self._active_threshold
+        if not audio_blocks:
+            return {"duration": 0.0, "n_active": 0, "max_consec": 0,
+                    "peak": 0.0, "seg_rms": 0.0, "threshold": thr}
+        rms_list = [float(np.sqrt(np.mean(b.astype(np.float32) ** 2)))
+                    for b in audio_blocks]
+        n_active = 0
+        cur_consec = max_consec = 0
+        for r in rms_list:
+            if r >= thr:
+                n_active += 1
+                cur_consec += 1
+                max_consec = max(max_consec, cur_consec)
+            else:
+                cur_consec = 0
+        concat = np.concatenate(audio_blocks).astype(np.float32)
+        return {
+            "duration": len(audio_blocks) * self.block_duration,
+            "n_active": n_active,
+            "max_consec": max_consec,
+            "peak": max(rms_list),
+            "seg_rms": float(np.sqrt(np.mean(concat ** 2))),
+            "threshold": thr,
+        }
+
+    def _segment_passes_gate(
+        self, audio_blocks: List[np.ndarray]
+    ) -> Tuple[bool, Dict[str, float]]:
+        """
+        段级语音门：判定候选段是否包含真实语音，决定是否值得送入 ASR。
+        三条硬条件全部满足才放行：
+          1) 活跃块数 ≥ min_active_blocks（排除单个咔哒/磕碰脉冲）
+          2) 最长连续活跃 ≥ min_max_consecutive_active（要求 ≥0.5s 持续能量）
+          3) 段峰值 ≥ 动态阈值 × peak_factor（确保能量显著高出本底噪声）
+        """
+        st = self._segment_stats(audio_blocks)
+        ok = (
+            st["n_active"] >= self.min_active_blocks
+            and st["max_consec"] >= self.min_max_consecutive_active
+            and st["peak"] >= st["threshold"] * self.peak_factor
+        )
+        return ok, st
     
     def _audio_callback(self, indata, frames, time_info, status):
         """sounddevice 音频采集回调（在音频线程中调用）"""
@@ -158,16 +247,31 @@ class MicrophoneListener:
         except queue.Full:
             pass  # 队列满了就丢弃，避免阻塞音频线程
     
+    # 非语音噪声上 Paraformer 最高发的幻觉输出：纯语气词。
+    # 这些文本不可能是有效唤醒词/指令，识别出来一律当空结果丢弃。
+    _HALLUCINATION_CHARS = frozenset("嗯啊哦呃哎唉唔诶呗嗳谢")
+
+    @classmethod
+    def _is_hallucination_text(cls, text: str) -> bool:
+        """识别结果是否为非语音幻觉（空串/纯标点/纯语气词）"""
+        s = cls._strip_punct(text).replace(" ", "")
+        if not s:
+            return True
+        return all(ch in cls._HALLUCINATION_CHARS for ch in s)
+
     def _recognize_audio(self, audio_chunks: List[np.ndarray]) -> str:
         """将累积的音频块拼接后进行识别"""
         if not audio_chunks:
             return ""
-        
+
         audio = np.concatenate(audio_chunks)
-        
+
         try:
             result = self.asr_engine.transcribe_waveform(audio)
             text = result.get("text", "").strip()
+            if text and self._is_hallucination_text(text):
+                logger.info(f"🚫 识别结果疑似非语音幻觉，已丢弃: {text!r}")
+                return ""
             return text
         except Exception as e:
             logger.error(f"识别失败: {e}")
@@ -443,48 +547,61 @@ class MicrophoneListener:
                         
                         # 静音足够长时间，处理累积的语音
                         if self.silence_blocks >= self.wake_silence_blocks_threshold and self.speech_buffer:
-                            # 检查语音段长度（至少0.5秒）
+                            # 检查语音段长度（至少0.4秒）
                             total_duration = len(self.speech_buffer) * self.block_duration
                             if total_duration >= 0.4:
-                                text = self._recognize_audio(self.speech_buffer)
-                                seg_rms = float(np.sqrt(np.mean(
-                                    np.concatenate(self.speech_buffer).astype(np.float32) ** 2)))
-                                # 可观测性：待机段无论是否命中唤醒词，都打印 ASR 原文
-                                logger.info(
-                                    f"🎧 待机语音段转写 ({total_duration:.1f}s, "
-                                    f"段RMS={seg_rms:.4f}, 静音阈值={self.silence_threshold:.4f}): {text!r}"
-                                )
-                                if text:
-                                    matched_ww = self._check_wake_word(text)
-                                    if matched_ww:
-                                        # 检测到唤醒词！
-                                        logger.info(f"🎤 检测到唤醒词: {matched_ww}")
-                                        
-                                        # 从文本中去掉唤醒词，得到后续指令前缀
-                                        command_text = text
-                                        for ww in self.wake_words:
-                                            command_text = command_text.lower().replace(ww.lower(), "", 1).strip()
-                                            command_text = command_text.lstrip("，。,. ")
-                                        
-                                        self._set_state(self.STATE_LISTENING)
-                                        self.command_buffer = []
-                                        self.silence_blocks = 0
-                                        
-                                        if self.on_wake_word:
-                                            try:
-                                                self.on_wake_word(matched_ww)
-                                            except Exception as e:
-                                                logger.error(f"唤醒词回调错误: {e}")
-                                        
-                                        # 如果唤醒词后面已经跟着指令了
-                                        if command_text:
-                                            self.command_buffer.extend(self.speech_buffer)
-                                            if self.on_partial:
+                                # 段级语音门：能量特征不达标的段（磕碰/键盘/底噪）直接丢弃，
+                                # 绝不送入 ASR——模型对这类音频会幻觉出文字，是"幻听"的根源。
+                                ok_gate, seg_st = self._segment_passes_gate(self.speech_buffer)
+                                if not ok_gate:
+                                    logger.info(
+                                        f"🔇 待机段未通过语音门控，丢弃不识别 "
+                                        f"({seg_st['duration']:.2f}s, 活跃块{seg_st['n_active']}"
+                                        f"/需≥{self.min_active_blocks}, 最长连续{seg_st['max_consec']}"
+                                        f"/需≥{self.min_max_consecutive_active}, "
+                                        f"峰值RMS={seg_st['peak']:.4f}"
+                                        f"/需≥{seg_st['threshold'] * self.peak_factor:.4f}, "
+                                        f"动态阈值={seg_st['threshold']:.4f})"
+                                    )
+                                else:
+                                    text = self._recognize_audio(self.speech_buffer)
+                                    # 可观测性：待机段无论是否命中唤醒词，都打印 ASR 原文
+                                    logger.info(
+                                        f"🎧 待机语音段转写 ({seg_st['duration']:.2f}s, "
+                                        f"段RMS={seg_st['seg_rms']:.4f}, 活跃块={seg_st['n_active']}, "
+                                        f"动态阈值={seg_st['threshold']:.4f}): {text!r}"
+                                    )
+                                    if text:
+                                        matched_ww = self._check_wake_word(text)
+                                        if matched_ww:
+                                            # 检测到唤醒词！
+                                            logger.info(f"🎤 检测到唤醒词: {matched_ww}")
+
+                                            # 从文本中去掉唤醒词，得到后续指令前缀
+                                            command_text = text
+                                            for ww in self.wake_words:
+                                                command_text = command_text.lower().replace(ww.lower(), "", 1).strip()
+                                                command_text = command_text.lstrip("，。,. ")
+
+                                            self._set_state(self.STATE_LISTENING)
+                                            self.command_buffer = []
+                                            self.silence_blocks = 0
+
+                                            if self.on_wake_word:
                                                 try:
-                                                    self.on_partial(command_text)
-                                                except:
-                                                    pass
-                            
+                                                    self.on_wake_word(matched_ww)
+                                                except Exception as e:
+                                                    logger.error(f"唤醒词回调错误: {e}")
+
+                                            # 如果唤醒词后面已经跟着指令了
+                                            if command_text:
+                                                self.command_buffer.extend(self.speech_buffer)
+                                                if self.on_partial:
+                                                    try:
+                                                        self.on_partial(command_text)
+                                                    except:
+                                                        pass
+
                             # 清空缓冲区
                             self.speech_buffer = []
                             self.silence_blocks = 0
@@ -502,25 +619,40 @@ class MicrophoneListener:
                     if self.silence_blocks >= self.silence_blocks_threshold:
                         total_duration = len(self.command_buffer) * self.block_duration
                         if total_duration >= 0.3:
-                            text = self._recognize_audio(self.command_buffer)
-                            logger.info(f"🎧 指令语音段转写 ({total_duration:.1f}s): {text!r}")
-                            if text:
-                                # 去掉可能残留的唤醒词
-                                for ww in self.wake_words:
-                                    text = text.replace(ww, "").replace(ww.lower(), "").strip()
-                                    text = text.lstrip("，。,. ")
-                                
+                            # 语音门：唤醒后若整段没有真实语音（误唤醒/人没说话），
+                            # 绝不送 ASR、绝不触发任务回调——此前底噪被幻觉成
+                            # "奇怪指令"并 POST 执行的问题就出在这里。
+                            ok_gate, seg_st = self._segment_passes_gate(self.command_buffer)
+                            if not ok_gate:
+                                logger.info(
+                                    f"🔇 唤醒后未检测到有效语音，静音丢弃（不识别/不回调） "
+                                    f"({seg_st['duration']:.2f}s, 活跃块{seg_st['n_active']}, "
+                                    f"最长连续{seg_st['max_consec']}, 峰值RMS={seg_st['peak']:.4f}, "
+                                    f"动态阈值={seg_st['threshold']:.4f})"
+                                )
+                            else:
+                                text = self._recognize_audio(self.command_buffer)
+                                logger.info(
+                                    f"🎧 指令语音段转写 ({seg_st['duration']:.2f}s, "
+                                    f"活跃块={seg_st['n_active']}): {text!r}"
+                                )
                                 if text:
-                                    logger.info(f"📝 指令识别: {text}")
-                                    if self.on_result:
-                                        try:
-                                            self.on_result(text)
-                                        except Exception as e:
-                                            logger.error(f"结果回调错误: {e}")
-                                    # 调用 HTTP 回调接口
-                                    if self.task_callback_url:
-                                        self._post_task_callback(text)
-                        
+                                    # 去掉可能残留的唤醒词
+                                    for ww in self.wake_words:
+                                        text = text.replace(ww, "").replace(ww.lower(), "").strip()
+                                        text = text.lstrip("，。,. ")
+
+                                    if text:
+                                        logger.info(f"📝 指令识别: {text}")
+                                        if self.on_result:
+                                            try:
+                                                self.on_result(text)
+                                            except Exception as e:
+                                                logger.error(f"结果回调错误: {e}")
+                                        # 调用 HTTP 回调接口
+                                        if self.task_callback_url:
+                                            self._post_task_callback(text)
+
                         # 回到待机状态
                         self.command_buffer = []
                         self.speech_buffer = []
@@ -913,6 +1045,7 @@ class MicrophoneListener:
             "state": self.state,
             "wake_words": self.wake_words,
             "silence_threshold": self.silence_threshold,
+            "active_threshold": self._active_threshold,
             "input_gain": self.input_gain,
             "current_rms": self.current_rms,
             "task_callback_url": self.task_callback_url,
